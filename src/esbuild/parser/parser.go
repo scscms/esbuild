@@ -37,6 +37,7 @@ type parser struct {
 	jsx                      JSXOptions
 	latestReturnHadSemicolon bool
 	allocatedNames           []string
+	latestArrowArgLoc        ast.Loc
 	currentScope             *ast.Scope
 	symbols                  []ast.Symbol
 	exportsRef               ast.Ref
@@ -568,6 +569,12 @@ func (p *parser) skipTypeScriptObjectType() {
 			}
 
 			p.lexer.Expect(lexer.TCloseBracket)
+
+			// "{ [K in keyof T]?: T[K] }"
+			if p.lexer.Token == lexer.TQuestion {
+				p.lexer.Next()
+			}
+
 			p.lexer.Expect(lexer.TColon)
 			p.skipTypeScriptType(ast.LLowest)
 
@@ -734,7 +741,8 @@ func (p *parser) skipTypeScriptTypeStmt() {
 // until we discover which state we're in.
 type deferredErrors struct {
 	// These are errors for expressions
-	invalidExprDefaultValue ast.Range
+	invalidExprDefaultValue  ast.Range
+	invalidExprQuestionColon ast.Range
 
 	// These are errors for destructuring patterns
 	invalidBindingCommaAfterSpread ast.Range
@@ -744,8 +752,26 @@ func (from *deferredErrors) mergeInto(to *deferredErrors) {
 	if from.invalidExprDefaultValue.Len > 0 {
 		to.invalidExprDefaultValue = from.invalidExprDefaultValue
 	}
+	if from.invalidExprQuestionColon.Len > 0 {
+		to.invalidExprQuestionColon = from.invalidExprQuestionColon
+	}
 	if from.invalidBindingCommaAfterSpread.Len > 0 {
 		to.invalidBindingCommaAfterSpread = from.invalidBindingCommaAfterSpread
+	}
+}
+
+func (p *parser) logExprErrors(errors *deferredErrors) {
+	if errors.invalidExprDefaultValue.Len > 0 {
+		p.addRangeError(errors.invalidExprDefaultValue, "Unexpected \"=\"")
+	}
+	if errors.invalidExprQuestionColon.Len > 0 {
+		p.addRangeError(errors.invalidExprQuestionColon, "Unexpected \":\"")
+	}
+}
+
+func (p *parser) logBindingErrors(errors *deferredErrors) {
+	if errors.invalidBindingCommaAfterSpread.Len > 0 {
+		p.addRangeError(errors.invalidBindingCommaAfterSpread, "Unexpected \",\" after rest pattern")
 	}
 }
 
@@ -1111,7 +1137,7 @@ func (p *parser) parseAsyncExpr(asyncRange ast.Range, level ast.L) ast.Expr {
 		expr = ast.Expr{asyncRange.Loc, &ast.EIdentifier{p.storeNameInRef("async")}}
 	}
 
-	return p.parseSuffix(expr, level)
+	return p.parseSuffix(expr, level, nil)
 }
 
 func (p *parser) parseFnExpr(loc ast.Loc, isAsync bool) ast.Expr {
@@ -1146,18 +1172,6 @@ func (p *parser) parseFnExpr(loc ast.Loc, isAsync bool) ast.Expr {
 	return ast.Expr{loc, &ast.EFunction{fn}}
 }
 
-func (p *parser) logExprErrors(errors *deferredErrors) {
-	if errors.invalidExprDefaultValue.Len > 0 {
-		p.addRangeError(errors.invalidExprDefaultValue, "Unexpected \"=\"")
-	}
-}
-
-func (p *parser) logBindingErrors(errors *deferredErrors) {
-	if errors.invalidBindingCommaAfterSpread.Len > 0 {
-		p.addRangeError(errors.invalidBindingCommaAfterSpread, "Unexpected \",\" after rest pattern")
-	}
-}
-
 // This assumes that the open parenthesis has already been parsed by the caller
 func (p *parser) parseParenExpr(loc ast.Loc, isAsync bool) ast.Expr {
 	items := []ast.Expr{}
@@ -1178,6 +1192,7 @@ func (p *parser) parseParenExpr(loc ast.Loc, isAsync bool) ast.Expr {
 		// We don't know yet whether these are arguments or expressions, so parse
 		// a superset of the expression syntax. Errors about things that are valid
 		// in one but not in the other are deferred.
+		p.latestArrowArgLoc = p.lexer.Loc()
 		item := p.parseExprOrBindings(ast.LComma, &errors)
 
 		if isSpread {
@@ -1818,14 +1833,14 @@ func (p *parser) parseIndexExpr() ast.Expr {
 }
 
 func (p *parser) parseExprOrBindings(level ast.L, errors *deferredErrors) ast.Expr {
-	return p.parseSuffix(p.parsePrefix(level, errors), level)
+	return p.parseSuffix(p.parsePrefix(level, errors), level, errors)
 }
 
 func (p *parser) parseExpr(level ast.L) ast.Expr {
-	return p.parseSuffix(p.parsePrefix(level, nil), level)
+	return p.parseSuffix(p.parsePrefix(level, nil), level, nil)
 }
 
-func (p *parser) parseSuffix(left ast.Expr, level ast.L) ast.Expr {
+func (p *parser) parseSuffix(left ast.Expr, level ast.L, errors *deferredErrors) ast.Expr {
 	for {
 		switch p.lexer.Token {
 		case lexer.TDot:
@@ -1918,6 +1933,17 @@ func (p *parser) parseSuffix(left ast.Expr, level ast.L) ast.Expr {
 				return left
 			}
 			p.lexer.Next()
+
+			// Bail now if we're parsing TypeScript and we see a ":", since it's
+			// obviously not an expression and could be an arrow function argument
+			// like this: "(arg?: string) => {}"
+			if p.ts.Parse && p.lexer.Token == lexer.TColon && left.Loc == p.latestArrowArgLoc {
+				if errors == nil {
+					p.lexer.Unexpected()
+				}
+				errors.invalidExprQuestionColon = p.lexer.Range()
+				return left
+			}
 
 			// Allow "in" in between "?" and ":"
 			oldAllowIn := p.allowIn
@@ -3422,7 +3448,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 		case lexer.TOpenParen, lexer.TDot:
 			// "import('path')"
 			// "import.meta"
-			expr := p.parseSuffix(p.parseImportExpr(loc, name), ast.LLowest)
+			expr := p.parseSuffix(p.parseImportExpr(loc, name), ast.LLowest, nil)
 			p.lexer.ExpectOrInsertSemicolon()
 			return ast.Stmt{loc, &ast.SExpr{expr}}
 
