@@ -1193,6 +1193,10 @@ func (b *Bundle) computeModuleGroups(
 }
 
 func (b *Bundle) Compile(log logging.Log, options BundleOptions) []BundleResult {
+	if options.ExtensionToLoader == nil {
+		options.ExtensionToLoader = DefaultExtensionToLoaderMap()
+	}
+
 	if options.Bundle {
 		return b.compileBundle(log, options)
 	} else {
@@ -1426,7 +1430,11 @@ func (b *Bundle) outputFileForEntryPoint(entryPoint uint32, options *BundleOptio
 	name := b.fs.Base(b.sources[entryPoint].AbsolutePath)
 
 	// Strip known file extensions
-	for _, ext := range []string{".min.js", ".js", ".jsx", ".mjs"} {
+	for ext, _ := range options.ExtensionToLoader {
+		if strings.HasSuffix(name, ".min"+ext) {
+			name = name[:len(name)-len(".min"+ext)]
+			break
+		}
 		if strings.HasSuffix(name, ext) {
 			name = name[:len(name)-len(ext)]
 			break
