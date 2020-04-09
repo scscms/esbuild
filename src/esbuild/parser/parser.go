@@ -1825,6 +1825,11 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 		target := p.parseExpr(ast.LCall)
 		args := []ast.Expr{}
 
+		// Skip over TypeScript type arguments here if there are any
+		if p.ts.Parse && p.lexer.Token == lexer.TLessThan {
+			p.trySkipTypeScriptTypeArgumentsWithBacktracking()
+		}
+
 		if p.lexer.Token == lexer.TOpenParen {
 			args = p.parseCallArgs()
 		}
