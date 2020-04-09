@@ -46,9 +46,11 @@ type parser struct {
 	moduleRef                ast.Ref
 
 	// These are for TypeScript
-	enclosingNamespaceRef     *ast.Ref
-	emittedNamespaceVars      map[ast.Ref]bool
-	isExportedInsideNamespace map[ast.Ref]ast.Ref
+	shouldFoldNumericConstants bool
+	enclosingNamespaceRef      *ast.Ref
+	emittedNamespaceVars       map[ast.Ref]bool
+	isExportedInsideNamespace  map[ast.Ref]ast.Ref
+	knownEnumValues            map[ast.Ref]map[string]float64
 
 	// These are for handling ES6 imports and exports
 	indirectImportItems     map[ast.Ref]bool
@@ -4144,8 +4146,6 @@ func (p *parser) parseEnumStmt(loc ast.Loc, opts parseStmtOpts) ast.Stmt {
 	p.lexer.Expect(lexer.TOpenBrace)
 
 	values := []ast.EnumValue{}
-	nextNumericValue := float64(0)
-	hasNumericValue := true
 
 	for p.lexer.Token != lexer.TCloseBrace {
 		value := ast.EnumValue{
@@ -4161,7 +4161,6 @@ func (p *parser) parseEnumStmt(loc ast.Loc, opts parseStmtOpts) ast.Stmt {
 		} else {
 			p.lexer.Expect(lexer.TIdentifier)
 		}
-		nameRange := p.lexer.Range()
 		p.lexer.Next()
 
 		// Identifiers can be referenced by other values
@@ -4172,21 +4171,11 @@ func (p *parser) parseEnumStmt(loc ast.Loc, opts parseStmtOpts) ast.Stmt {
 			}
 		}
 
-		// Parse the value
+		// Parse the initializer
 		if p.lexer.Token == lexer.TEquals {
 			p.lexer.Next()
-			value.Value = p.parseExpr(ast.LComma)
-			if number, ok := value.Value.Data.(*ast.ENumber); ok {
-				hasNumericValue = true
-				nextNumericValue = number.Value + 1
-			} else {
-				hasNumericValue = false
-			}
-		} else if hasNumericValue {
-			value.Value = ast.Expr{ast.Loc{nameRange.Loc.Start + nameRange.Len}, &ast.ENumber{nextNumericValue}}
-			nextNumericValue++
-		} else {
-			value.Value = ast.Expr{ast.Loc{nameRange.Loc.Start + nameRange.Len}, &ast.EUndefined{}}
+			initializer := p.parseExpr(ast.LComma)
+			value.Value = &initializer
 		}
 
 		values = append(values, value)
@@ -5544,12 +5533,46 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 			}
 		}
 
-		// Create an assignment for each enum value
+		// Values without initializers are initialized to one more than the
+		// previous value if the previous value is numeric. Otherwise values
+		// without initializers are initialized to undefined.
+		nextNumericValue := float64(0)
+		hasNumericValue := true
 		valueExprs := []ast.Expr{}
+
+		// Track values so they can be used by constant folding. We need to follow
+		// links here in case the enum was merged with a preceding namespace.
+		valuesSoFar := make(map[string]float64)
+		p.knownEnumValues[s.Name.Ref] = valuesSoFar
+		p.knownEnumValues[s.Arg] = valuesSoFar
+
+		// We normally don't fold numeric constants because they might increase code
+		// size, but it's important to fold numeric constants inside enums since
+		// that's what the TypeScript compiler does.
+		oldShouldFoldNumericConstants := p.shouldFoldNumericConstants
+		p.shouldFoldNumericConstants = true
+
+		// Create an assignment for each enum value
 		for _, value := range s.Values {
-			value.Value = p.visitExpr(value.Value)
 			name := lexer.UTF16ToString(value.Name)
 			var assignTarget ast.Expr
+
+			if value.Value != nil {
+				*value.Value = p.visitExpr(*value.Value)
+				if number, ok := value.Value.Data.(*ast.ENumber); ok {
+					valuesSoFar[name] = number.Value
+					hasNumericValue = true
+					nextNumericValue = number.Value + 1
+				} else {
+					hasNumericValue = false
+				}
+			} else if hasNumericValue {
+				valuesSoFar[name] = nextNumericValue
+				value.Value = &ast.Expr{value.Loc, &ast.ENumber{nextNumericValue}}
+				nextNumericValue++
+			} else {
+				value.Value = &ast.Expr{value.Loc, &ast.EUndefined{}}
+			}
 
 			if p.mangleSyntax && lexer.IsIdentifier(name) {
 				// "Enum.Name = value"
@@ -5560,7 +5583,7 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 						Name:    name,
 						NameLoc: value.Loc,
 					}},
-					value.Value,
+					*value.Value,
 				}}
 			} else {
 				// "Enum['Name'] = value"
@@ -5570,7 +5593,7 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 						Target: ast.Expr{value.Loc, &ast.EIdentifier{s.Arg}},
 						Index:  ast.Expr{value.Loc, &ast.EString{value.Name}},
 					}},
-					value.Value,
+					*value.Value,
 				}}
 			}
 			p.recordUsage(s.Arg)
@@ -5586,6 +5609,8 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 			}})
 			p.recordUsage(s.Arg)
 		}
+
+		p.shouldFoldNumericConstants = oldShouldFoldNumericConstants
 
 		// Generate statements from expressions
 		valueStmts := []ast.Stmt{}
@@ -5935,11 +5960,11 @@ func (p *parser) warnAboutEqualityCheck(op string, value ast.Expr, afterOpLoc as
 // expression to replace the property access with. It assumes that the
 // target of the EDot expression has already been visited.
 func (p *parser) maybeRewriteDot(loc ast.Loc, data *ast.EDot) ast.Expr {
-	// Rewrite property accesses on explicit namespace imports as an identifier.
-	// This lets us replace them easily in the printer to rebind them to
-	// something else without paying the cost of a whole-tree traversal during
-	// module linking just to rewrite these EDot expressions.
 	if id, ok := data.Target.Data.(*ast.EIdentifier); ok {
+		// Rewrite property accesses on explicit namespace imports as an identifier.
+		// This lets us replace them easily in the printer to rebind them to
+		// something else without paying the cost of a whole-tree traversal during
+		// module linking just to rewrite these EDot expressions.
 		if importItems, ok := p.importItemsForNamespace[id.Ref]; ok {
 			var itemRef ast.Ref
 			var importData *ast.ENamespaceImport
@@ -5969,6 +5994,15 @@ func (p *parser) maybeRewriteDot(loc ast.Loc, data *ast.EDot) ast.Expr {
 			// Track how many times we've referenced this symbol
 			p.recordUsage(itemRef)
 			return ast.Expr{loc, importData}
+		}
+
+		// If this is a known enum value, inline the value of the enum
+		if p.ts.Parse {
+			if enumValueMap, ok := p.knownEnumValues[id.Ref]; ok {
+				if number, ok := enumValueMap[data.Name]; ok {
+					return ast.Expr{loc, &ast.ENumber{number}}
+				}
+			}
 		}
 	}
 
@@ -6077,12 +6111,24 @@ func (p *parser) visitExpr(expr ast.Expr) ast.Expr {
 		}
 
 		// Substitute a namespace export reference now if appropriate
-		if nsRef, ok := p.isExportedInsideNamespace[e.Ref]; ok {
-			return ast.Expr{expr.Loc, &ast.EDot{
-				Target:  ast.Expr{expr.Loc, &ast.EIdentifier{nsRef}},
-				Name:    name,
-				NameLoc: expr.Loc,
-			}}
+		if p.ts.Parse {
+			if nsRef, ok := p.isExportedInsideNamespace[e.Ref]; ok {
+				// If this is a known enum value, inline the value of the enum
+				if p.ts.Parse {
+					if enumValueMap, ok := p.knownEnumValues[nsRef]; ok {
+						if number, ok := enumValueMap[name]; ok {
+							return ast.Expr{expr.Loc, &ast.ENumber{number}}
+						}
+					}
+				}
+
+				// Otherwise, create a property access on the namespace
+				return ast.Expr{expr.Loc, &ast.EDot{
+					Target:  ast.Expr{expr.Loc, &ast.EIdentifier{nsRef}},
+					Name:    name,
+					NameLoc: expr.Loc,
+				}}
+			}
 		}
 
 		// Substitute user-specified defines for unbound symbols
@@ -6273,6 +6319,12 @@ func (p *parser) visitExpr(expr ast.Expr) ast.Expr {
 			}
 
 		case ast.BinOpAdd:
+			if p.shouldFoldNumericConstants {
+				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
+					return ast.Expr{expr.Loc, &ast.ENumber{left + right}}
+				}
+			}
+
 			// "'abc' + 'xyz'" => "'abcxyz'"
 			if result := foldStringAddition(e.Left, e.Right); result != nil {
 				return *result
@@ -6284,22 +6336,113 @@ func (p *parser) visitExpr(expr ast.Expr) ast.Expr {
 					return ast.Expr{expr.Loc, &ast.EBinary{left.Op, left.Left, *result}}
 				}
 			}
+
+		case ast.BinOpSub:
+			if p.shouldFoldNumericConstants {
+				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
+					return ast.Expr{expr.Loc, &ast.ENumber{left - right}}
+				}
+			}
+
+		case ast.BinOpMul:
+			if p.shouldFoldNumericConstants {
+				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
+					return ast.Expr{expr.Loc, &ast.ENumber{left * right}}
+				}
+			}
+
+		case ast.BinOpDiv:
+			if p.shouldFoldNumericConstants {
+				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
+					return ast.Expr{expr.Loc, &ast.ENumber{left / right}}
+				}
+			}
+
+		case ast.BinOpRem:
+			if p.shouldFoldNumericConstants {
+				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
+					return ast.Expr{expr.Loc, &ast.ENumber{math.Mod(left, right)}}
+				}
+			}
+
+		case ast.BinOpPow:
+			if p.shouldFoldNumericConstants {
+				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
+					return ast.Expr{expr.Loc, &ast.ENumber{math.Pow(left, right)}}
+				}
+			}
+
+		case ast.BinOpShl:
+			if p.shouldFoldNumericConstants {
+				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
+					return ast.Expr{expr.Loc, &ast.ENumber{float64(int32(left) << int32(right))}}
+				}
+			}
+
+		case ast.BinOpShr:
+			if p.shouldFoldNumericConstants {
+				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
+					return ast.Expr{expr.Loc, &ast.ENumber{float64(int32(left) >> int32(right))}}
+				}
+			}
+
+		case ast.BinOpUShr:
+			if p.shouldFoldNumericConstants {
+				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
+					return ast.Expr{expr.Loc, &ast.ENumber{float64(uint32(left) >> uint32(right))}}
+				}
+			}
+
+		case ast.BinOpBitwiseAnd:
+			if p.shouldFoldNumericConstants {
+				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
+					return ast.Expr{expr.Loc, &ast.ENumber{float64(int32(left) & int32(right))}}
+				}
+			}
+
+		case ast.BinOpBitwiseOr:
+			if p.shouldFoldNumericConstants {
+				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
+					return ast.Expr{expr.Loc, &ast.ENumber{float64(int32(left) | int32(right))}}
+				}
+			}
+
+		case ast.BinOpBitwiseXor:
+			if p.shouldFoldNumericConstants {
+				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
+					return ast.Expr{expr.Loc, &ast.ENumber{float64(int32(left) ^ int32(right))}}
+				}
+			}
 		}
 
 	case *ast.EIndex:
 		e.Target = p.visitExpr(e.Target)
 		e.Index = p.visitExpr(e.Index)
 
-		if p.mangleSyntax {
-			// "a['b']" => "a.b"
+		if p.mangleSyntax || p.ts.Parse {
 			if id, ok := e.Index.Data.(*ast.EString); ok {
 				text := lexer.UTF16ToString(id.Value)
-				if lexer.IsIdentifier(text) {
-					return p.maybeRewriteDot(expr.Loc, &ast.EDot{
-						Target:  e.Target,
-						Name:    text,
-						NameLoc: e.Index.Loc,
-					})
+
+				// If this is a known enum value, inline the value of the enum
+				if p.ts.Parse {
+					if id, ok := e.Target.Data.(*ast.EIdentifier); ok {
+						if enumValueMap, ok := p.knownEnumValues[id.Ref]; ok {
+							if number, ok := enumValueMap[text]; ok {
+								return ast.Expr{expr.Loc, &ast.ENumber{number}}
+							}
+						}
+					}
+				}
+
+				// "a['b']" => "a.b"
+				if p.mangleSyntax {
+					if lexer.IsIdentifier(text) {
+						return p.maybeRewriteDot(expr.Loc, &ast.EDot{
+							Target:  e.Target,
+							Name:    text,
+							NameLoc: e.Index.Loc,
+						})
+					}
 				}
 			}
 		}
@@ -6552,6 +6695,15 @@ func (p *parser) visitExpr(expr ast.Expr) ast.Expr {
 	return expr
 }
 
+func extractNumericValues(left ast.Expr, right ast.Expr) (float64, float64, bool) {
+	if a, ok := left.Data.(*ast.ENumber); ok {
+		if b, ok := right.Data.(*ast.ENumber); ok {
+			return a.Value, b.Value, true
+		}
+	}
+	return 0, 0, false
+}
+
 func (p *parser) visitFn(fn *ast.Fn, scopeLoc ast.Loc) {
 	oldTryBodyCount := p.tryBodyCount
 	p.tryBodyCount = 0
@@ -6742,6 +6894,7 @@ func newParser(log logging.Log, source logging.Source, options ParseOptions) *pa
 		// These are for TypeScript
 		emittedNamespaceVars:      make(map[ast.Ref]bool),
 		isExportedInsideNamespace: make(map[ast.Ref]ast.Ref),
+		knownEnumValues:           make(map[ast.Ref]map[string]float64),
 
 		// These are for handling ES6 imports and exports
 		indirectImportItems:     make(map[ast.Ref]bool),
