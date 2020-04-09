@@ -550,6 +550,7 @@ type EnumValue struct {
 
 type SEnum struct {
 	Name     LocRef
+	Arg      Ref
 	Values   []EnumValue
 	IsExport bool
 }
