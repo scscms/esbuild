@@ -3401,9 +3401,10 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 					p.skipTypeScriptTypeStmt()
 					return ast.Stmt{loc, &ast.STypeScript{}}
 
-				case "namespace", "abstract":
+				case "namespace", "abstract", "module":
 					// "export namespace Foo {}"
 					// "export abstract class Foo {}"
+					// "export module Foo {}"
 					opts.isExport = true
 					return p.parseStmt(opts)
 
@@ -4075,7 +4076,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 							return ast.Stmt{loc, &ast.STypeScript{}}
 						}
 
-					case "namespace":
+					case "namespace", "module":
 						if (opts.isModuleScope || opts.isNamespaceScope) && p.lexer.Token == lexer.TIdentifier {
 							return p.parseNamespaceStmt(loc, opts)
 						}
